@@ -49,6 +49,13 @@
     lng?: number | null;
   };
 
+  type ReverseGeocodeResponse = {
+    ok: boolean;
+    address?: string;
+    message?: string;
+    raw?: JsonValue;
+  };
+
   type InsertedLetter = {
     id: string;
   };
@@ -113,6 +120,8 @@
   let cadastralData = $state<CuzkVerifyResponse | null>(null);
   let verifying = $state(false);
   let saving = $state(false);
+  let locatingAddress = $state(false);
+  let autoVerifiedForLocation = $state(false);
 
   let letterText = $state('');
 
@@ -135,26 +144,56 @@
     previews = previews.filter((_, previewIndex) => previewIndex !== index);
   }
 
-  function getGps() {
-    if (!navigator.geolocation) {
-      alert('Tento prohlížeč nepodporuje GPS polohu.');
-      return;
-    }
-
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        lat = position.coords.latitude;
-        lng = position.coords.longitude;
-        cuzkMode = 'gps';
-      },
-      () => {
-        alert('Nepodařilo se získat GPS polohu.');
-      },
-      {
-        enableHighAccuracy: true,
-        timeout: 10000
+  function getGpsPosition(): Promise<GeolocationPosition> {
+    return new Promise((resolvePosition, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error('Tento prohlížeč nepodporuje GPS polohu.'));
+        return;
       }
-    );
+
+      navigator.geolocation.getCurrentPosition(resolvePosition, reject, {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0
+      });
+    });
+  }
+
+  async function loadAddressFromMobileGps() {
+    locatingAddress = true;
+
+    try {
+      const position = await getGpsPosition();
+
+      lat = position.coords.latitude;
+      lng = position.coords.longitude;
+      cuzkMode = 'gps';
+      autoVerifiedForLocation = false;
+      cadastralData = null;
+
+      const response = await fetch(
+        resolve(`/api/reverse-geocode?lat=${lat}&lng=${lng}`)
+      );
+
+      const data = (await response.json()) as ReverseGeocodeResponse;
+
+      if (data.ok && data.address) {
+        address = data.address;
+      } else {
+        alert(data.message || 'GPS se načetla, ale adresu se nepodařilo dohledat.');
+      }
+    } catch (error) {
+      console.error(error);
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Nepodařilo se získat GPS polohu.';
+
+      alert(message);
+    } finally {
+      locatingAddress = false;
+    }
   }
 
   function buildCuzkRequestBody() {
@@ -196,19 +235,21 @@
         alert(data.message || 'ČÚZK nemovitost neověřil.');
         return;
       }
-
-      letterText = createLetterText({
-        salutation,
-        ownerName: ownerFullName || '[doplnit jméno]',
-        address
-      });
-
-      step = 4;
     } catch (error) {
       console.error(error);
       alert('Nastala chyba při ověřování nemovitosti.');
     } finally {
       verifying = false;
+    }
+  }
+
+  async function goToCuzkStep() {
+    cuzkMode = 'gps';
+    step = 3;
+
+    if (lat !== null && lng !== null && !autoVerifiedForLocation) {
+      await verifyProperty();
+      autoVerifiedForLocation = true;
     }
   }
 
@@ -374,10 +415,11 @@
         <h2 class="text-xl font-semibold">2. Poloha a adresa nemovitosti</h2>
 
         <button
-          class="w-full rounded-2xl bg-slate-900 p-4 font-semibold text-white"
-          onclick={getGps}
+          class="w-full rounded-2xl bg-slate-900 p-4 font-semibold text-white disabled:opacity-40"
+          onclick={loadAddressFromMobileGps}
+          disabled={locatingAddress}
         >
-          Najít GPS polohu
+          {locatingAddress ? 'Načítám adresu z mobilu…' : 'Načíst přesnou adresu z mobilu'}
         </button>
 
         {#if lat !== null && lng !== null}
@@ -390,10 +432,23 @@
           <span class="text-sm font-medium">Adresa nemovitosti pro dopis</span>
           <input
             bind:value={address}
-            placeholder="např. Ohrada 364, Všetaty"
+            placeholder="Klikni a načti adresu z mobilu"
+            onfocus={() => {
+              if (!address.trim() && !locatingAddress) {
+                void loadAddressFromMobileGps();
+              }
+            }}
+            oninput={() => {
+              autoVerifiedForLocation = false;
+              cadastralData = null;
+            }}
             class="mt-1 w-full rounded-2xl border p-3"
           />
         </label>
+
+        <p class="text-sm text-slate-500">
+          Adresa se načte podle GPS v mobilu. ČÚZK se v dalším kroku automaticky ověří podle uložených souřadnic.
+        </p>
 
         <div class="grid grid-cols-2 gap-3">
           <button
@@ -405,8 +460,8 @@
 
           <button
             class="rounded-2xl bg-black p-4 font-semibold text-white disabled:opacity-40"
-            onclick={() => (step = 3)}
-            disabled={!address.trim()}
+            onclick={goToCuzkStep}
+            disabled={!address.trim() || lat === null || lng === null || locatingAddress}
           >
             Další
           </button>
@@ -420,6 +475,12 @@
 
         <section class="rounded-3xl bg-slate-50 p-4">
           <h3 class="font-semibold">Ověření nemovitosti z ČÚZK</h3>
+
+          {#if verifying}
+            <p class="mt-3 rounded-2xl bg-blue-50 p-3 text-sm text-blue-800">
+              Ověřuji nemovitost podle GPS souřadnic…
+            </p>
+          {/if}
 
           <label class="mt-3 block">
             <span class="text-sm font-medium">Způsob ověření</span>
@@ -437,7 +498,7 @@
                 <p class="text-sm text-slate-600">Použije se GPS: {lat}, {lng}</p>
               {:else}
                 <p class="text-sm text-red-600">
-                  Pro GPS dotaz se vrať na krok 2 a klikni na „Najít GPS polohu“.
+                  Pro GPS dotaz se vrať na krok 2 a klikni na „Načíst přesnou adresu z mobilu“.
                 </p>
               {/if}
             </div>
@@ -552,7 +613,7 @@
           <button
             class="mt-4 w-full rounded-2xl bg-black p-4 font-semibold text-white disabled:opacity-40"
             onclick={verifyProperty}
-            disabled={verifying}
+            disabled={verifying || (cuzkMode === 'gps' && (lat === null || lng === null))}
           >
             {verifying ? 'Ověřuji…' : 'Ověřit přes ČÚZK'}
           </button>

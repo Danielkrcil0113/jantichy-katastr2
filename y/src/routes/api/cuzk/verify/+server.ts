@@ -71,7 +71,20 @@ type SjtskPoint = {
   north: number;
 };
 
+type SjtskCoordinate = {
+  y: number;
+  x: number;
+};
+
+type GpsAttempt = {
+  radiusMeters: number;
+  polygon: SjtskCoordinate[];
+  stavby: CuzkCallResult;
+  parcely: CuzkCallResult;
+};
+
 const DEFAULT_RADIUS_METERS = 12;
+const FALLBACK_RADIUS_METERS = [12, 25, 50, 100, 150];
 
 proj4.defs(
   'EPSG:5514',
@@ -99,6 +112,7 @@ function findFirstValue(source: JsonValue | null, aliases: string[]): JsonValue 
     if (Array.isArray(value)) {
       for (const item of value) {
         const found = walk(item);
+
         if (found !== null) return found;
       }
 
@@ -114,6 +128,7 @@ function findFirstValue(source: JsonValue | null, aliases: string[]): JsonValue 
 
       for (const child of Object.values(value)) {
         const found = walk(child);
+
         if (found !== null) return found;
       }
     }
@@ -129,6 +144,7 @@ function valueToString(value: JsonValue | null): string | null {
 
   if (typeof value === 'string') {
     const trimmed = value.trim();
+
     return trimmed || null;
   }
 
@@ -303,7 +319,7 @@ function gpsToSjtsk(lat: number, lng: number): SjtskPoint {
   };
 }
 
-function createSjtskSquare(point: SjtskPoint, radiusMeters: number) {
+function createSjtskSquare(point: SjtskPoint, radiusMeters: number): SjtskCoordinate[] {
   const east = point.east;
   const north = point.north;
 
@@ -329,6 +345,62 @@ function createSjtskSquare(point: SjtskPoint, radiusMeters: number) {
       x: Number((east - radiusMeters).toFixed(2))
     }
   ];
+}
+
+function hasUsableCuzkData(data: JsonValue | null): boolean {
+  if (data === null) return false;
+
+  if (Array.isArray(data)) {
+    return data.length > 0;
+  }
+
+  if (isJsonObject(data)) {
+    const values = Object.values(data);
+
+    if (values.length === 0) return false;
+
+    const possibleResultKeys = [
+      'stavby',
+      'parcely',
+      'items',
+      'data',
+      'results',
+      'vysledky',
+      'seznam'
+    ];
+
+    for (const key of possibleResultKeys) {
+      const foundValue = findFirstValue(data, [key]);
+
+      if (Array.isArray(foundValue) && foundValue.length > 0) {
+        return true;
+      }
+    }
+
+    return values.some((value) => {
+      if (value === null) return false;
+
+      if (Array.isArray(value)) {
+        return value.length > 0;
+      }
+
+      if (isJsonObject(value)) {
+        return Object.keys(value).length > 0;
+      }
+
+      if (typeof value === 'string') {
+        return value.trim() !== '';
+      }
+
+      return true;
+    });
+  }
+
+  if (typeof data === 'string') {
+    return data.trim() !== '';
+  }
+
+  return true;
 }
 
 function normalizeCuzkData(
@@ -449,6 +521,77 @@ function normalizeCuzkData(
   };
 }
 
+async function verifyByGpsPolygon(
+  fetcher: typeof fetch,
+  lat: number,
+  lng: number,
+  requestedRadiusMeters: number
+) {
+  const sjtskPoint = gpsToSjtsk(lat, lng);
+
+  const radiiToTry = Array.from(
+    new Set([requestedRadiusMeters, ...FALLBACK_RADIUS_METERS])
+  )
+    .filter((radiusMeters) => radiusMeters > 0)
+    .sort((a, b) => a - b);
+
+  const attempts: GpsAttempt[] = [];
+
+  for (const radiusMeters of radiiToTry) {
+    const polygon = createSjtskSquare(sjtskPoint, radiusMeters);
+    const polygonString = JSON.stringify(polygon);
+
+    const [stavby, parcely] = await Promise.all([
+      callCuzk(fetcher, '/api/v1/Stavby/Polygon', {
+        SeznamSouradnic: polygonString
+      }),
+      callCuzk(fetcher, '/api/v1/Parcely/Polygon', {
+        SeznamSouradnic: polygonString
+      })
+    ]);
+
+    attempts.push({
+      radiusMeters,
+      polygon,
+      stavby,
+      parcely
+    });
+
+    const foundStavba = stavby.ok && hasUsableCuzkData(stavby.data);
+    const foundParcela = parcely.ok && hasUsableCuzkData(parcely.data);
+
+    if (foundStavba || foundParcela) {
+      return {
+        found: true,
+        radiusMeters,
+        sjtskPoint,
+        polygon,
+        propertyType: foundStavba ? 'stavba' : 'parcela',
+        primaryData: foundStavba ? stavby.data : parcely.data,
+        stavby,
+        parcely,
+        attempts,
+        radiiToTry
+      };
+    }
+  }
+
+  const lastAttempt = attempts.at(-1);
+
+  return {
+    found: false,
+    radiusMeters: requestedRadiusMeters,
+    sjtskPoint,
+    polygon: lastAttempt?.polygon ?? createSjtskSquare(sjtskPoint, requestedRadiusMeters),
+    propertyType: null,
+    primaryData: null,
+    stavby: lastAttempt?.stavby ?? null,
+    parcely: lastAttempt?.parcely ?? null,
+    attempts,
+    radiiToTry
+  };
+}
+
 export const GET: RequestHandler = async ({ fetch }) => {
   const health = await callCuzk(fetch, '/api/v1/AplikacniSluzby/Health');
   const aktualnostDat = await callCuzk(fetch, '/api/v1/AplikacniSluzby/AktualnostDat');
@@ -492,41 +635,63 @@ export const POST: RequestHandler = async ({ request, fetch }) => {
         });
       }
 
-      const radiusMeters = readPositiveNumber(body.radiusMeters, DEFAULT_RADIUS_METERS);
-      const sjtskPoint = gpsToSjtsk(body.lat, body.lng);
-      const polygon = createSjtskSquare(sjtskPoint, radiusMeters);
-      const polygonString = JSON.stringify(polygon);
+      const requestedRadiusMeters = readPositiveNumber(
+        body.radiusMeters,
+        DEFAULT_RADIUS_METERS
+      );
 
-      const [stavby, parcely] = await Promise.all([
-        callCuzk(fetch, '/api/v1/Stavby/Polygon', {
-          SeznamSouradnic: polygonString
-        }),
-        callCuzk(fetch, '/api/v1/Parcely/Polygon', {
-          SeznamSouradnic: polygonString
-        })
-      ]);
+      const gpsResult = await verifyByGpsPolygon(
+        fetch,
+        body.lat,
+        body.lng,
+        requestedRadiusMeters
+      );
 
-      const verified = stavby.ok || parcely.ok;
-      const propertyType = stavby.ok ? 'stavba' : parcely.ok ? 'parcela' : null;
-      const primaryData = stavby.ok ? stavby.data : parcely.ok ? parcely.data : null;
+      if (gpsResult.found) {
+        return json({
+          ok: true,
+          verified: true,
+          mode,
+          address,
+          lat: body.lat,
+          lng: body.lng,
+          radiusMeters: gpsResult.radiusMeters,
+          triedRadiusMeters: gpsResult.radiiToTry,
+          sjtskPoint: gpsResult.sjtskPoint,
+          polygon: gpsResult.polygon,
+          message:
+            gpsResult.radiusMeters === requestedRadiusMeters
+              ? 'ČÚZK našel nemovitost podle GPS polygonu.'
+              : `ČÚZK našel nemovitost až při rozšířeném GPS polygonu ${gpsResult.radiusMeters} m.`,
+          normalized: normalizeCuzkData(gpsResult.primaryData, gpsResult.propertyType),
+          results: {
+            selectedRadiusMeters: gpsResult.radiusMeters,
+            triedRadiusMeters: gpsResult.radiiToTry,
+            attempts: gpsResult.attempts,
+            stavby: gpsResult.stavby,
+            parcely: gpsResult.parcely
+          }
+        });
+      }
 
       return json({
-        ok: verified,
-        verified,
+        ok: false,
+        verified: false,
         mode,
         address,
         lat: body.lat,
         lng: body.lng,
-        radiusMeters,
-        sjtskPoint,
-        polygon,
-        message: verified
-          ? 'ČÚZK našel nemovitost podle GPS polygonu.'
-          : 'ČÚZK podle GPS polygonu nic nenašel.',
-        normalized: normalizeCuzkData(primaryData, propertyType),
+        radiusMeters: requestedRadiusMeters,
+        triedRadiusMeters: gpsResult.radiiToTry,
+        sjtskPoint: gpsResult.sjtskPoint,
+        polygon: gpsResult.polygon,
+        message:
+          'ČÚZK nenašel nemovitost ani po automatickém rozšíření GPS polygonu. Zkus ručně ověření přes kód adresního místa, stavbu nebo parcelu.',
+        normalized: normalizeCuzkData(null, null),
         results: {
-          stavby,
-          parcely
+          selectedRadiusMeters: null,
+          triedRadiusMeters: gpsResult.radiiToTry,
+          attempts: gpsResult.attempts
         }
       });
     }
@@ -550,13 +715,15 @@ export const POST: RequestHandler = async ({ request, fetch }) => {
         `/api/v1/Stavby/AdresniMisto/${kodAdresnihoMista}`
       );
 
+      const found = stavba.ok && hasUsableCuzkData(stavba.data);
+
       return json({
-        ok: stavba.ok,
-        verified: stavba.ok,
+        ok: found,
+        verified: found,
         mode,
         address,
-        message: messageFromCuzkStatus(stavba.status),
-        normalized: normalizeCuzkData(stavba.ok ? stavba.data : null, 'stavba'),
+        message: found ? 'Nemovitost byla nalezena.' : messageFromCuzkStatus(stavba.status),
+        normalized: normalizeCuzkData(found ? stavba.data : null, 'stavba'),
         request: {
           kodAdresnihoMista
         },
@@ -589,13 +756,15 @@ export const POST: RequestHandler = async ({ request, fetch }) => {
         CisloDomovni: cisloDomovni
       });
 
+      const found = stavby.ok && hasUsableCuzkData(stavby.data);
+
       return json({
-        ok: stavby.ok,
-        verified: stavby.ok,
+        ok: found,
+        verified: found,
         mode,
         address,
-        message: messageFromCuzkStatus(stavby.status),
-        normalized: normalizeCuzkData(stavby.ok ? stavby.data : null, 'stavba'),
+        message: found ? 'Nemovitost byla nalezena.' : messageFromCuzkStatus(stavby.status),
+        normalized: normalizeCuzkData(found ? stavby.data : null, 'stavba'),
         request: {
           kodCastiObce,
           typStavby,
@@ -643,13 +812,15 @@ export const POST: RequestHandler = async ({ request, fetch }) => {
         PuvodParcelyZE: puvodParcelyZe
       });
 
+      const found = parcely.ok && hasUsableCuzkData(parcely.data);
+
       return json({
-        ok: parcely.ok,
-        verified: parcely.ok,
+        ok: found,
+        verified: found,
         mode,
         address,
-        message: messageFromCuzkStatus(parcely.status),
-        normalized: normalizeCuzkData(parcely.ok ? parcely.data : null, 'parcela'),
+        message: found ? 'Nemovitost byla nalezena.' : messageFromCuzkStatus(parcely.status),
+        normalized: normalizeCuzkData(found ? parcely.data : null, 'parcela'),
         request: {
           kodKatastralnihoUzemi,
           typParcely,
